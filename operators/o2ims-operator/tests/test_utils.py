@@ -14,12 +14,17 @@
 # limitations under the License.
 ##########################################################################
 
-import responses
+import http.server
 import os
-import pytest
 import random
 import string
+import threading
 
+import certifi
+import pytest
+import responses
+
+from controllers import utils
 from controllers.utils import (
     KUBERNETES_BASE_URL,
     create_package_variant,
@@ -268,3 +273,186 @@ def test_get_capi_cluster(http_code, status, response_2, response_2_value, excep
         )
     response = get_capi_cluster(NAME, NAMESPACE)
     assert response["status"] == status and response[response_2] == response_2_value
+
+
+@pytest.fixture
+def no_ambient_tls_config(monkeypatch, tmp_path):
+    """Make the tests behave the same on a laptop and inside a pod."""
+    monkeypatch.setattr(
+        utils, "IN_CLUSTER_CA_FILE", str(tmp_path / "absent-ca.crt")
+    )
+    monkeypatch.delenv("KUBERNETES_CA_FILE", raising=False)
+    monkeypatch.delenv("UNSAFE_SKIP_TLS_VERIFY", raising=False)
+
+
+def test_tls_is_verified_by_default(no_ambient_tls_config):
+    # True is what requests calls "verify against the system trust store"
+    assert utils.tls_verify() is True
+
+
+def usable_ca_bundle(tmp_path, name):
+    """Return a path holding a bundle OpenSSL will actually load."""
+    bundle = tmp_path / name
+    bundle.write_bytes(open(certifi.where(), "rb").read())
+    return str(bundle)
+
+
+def test_in_cluster_ca_bundle_is_used_when_present(
+    no_ambient_tls_config, monkeypatch, tmp_path
+):
+    ca_file = usable_ca_bundle(tmp_path, "ca.crt")
+    monkeypatch.setattr(utils, "IN_CLUSTER_CA_FILE", ca_file)
+    assert utils.tls_verify() == ca_file
+
+
+def test_kubernetes_ca_file_wins(no_ambient_tls_config, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        utils, "IN_CLUSTER_CA_FILE", usable_ca_bundle(tmp_path, "in-cluster.crt"))
+    configured = usable_ca_bundle(tmp_path, "configured.crt")
+    monkeypatch.setenv("KUBERNETES_CA_FILE", configured)
+    assert utils.tls_verify() == configured
+
+
+def test_a_missing_ca_file_is_refused(no_ambient_tls_config, monkeypatch, tmp_path):
+    missing = str(tmp_path / "missing.crt")
+    monkeypatch.setenv("KUBERNETES_CA_FILE", missing)
+    with pytest.raises(RuntimeError, match=missing):
+        utils.tls_verify()
+
+
+@pytest.mark.parametrize("content", ["", "   ", "not a pem\n", "-----BEGIN-----"])
+def test_an_unusable_ca_bundle_is_refused(
+    no_ambient_tls_config, monkeypatch, tmp_path, content
+):
+    """A path check alone would defer this to the first request."""
+    bundle = tmp_path / "ca.crt"
+    bundle.write_text(content)
+    monkeypatch.setenv("KUBERNETES_CA_FILE", str(bundle))
+    with pytest.raises(RuntimeError, match="unusable"):
+        utils.tls_verify()
+
+
+def test_a_ca_bundle_and_skip_verify_together_are_refused(
+    no_ambient_tls_config, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("KUBERNETES_CA_FILE", usable_ca_bundle(tmp_path, "ca.crt"))
+    monkeypatch.setenv("UNSAFE_SKIP_TLS_VERIFY", "true")
+    with pytest.raises(RuntimeError, match="conflict"):
+        utils.tls_verify()
+
+
+def test_a_missing_in_cluster_ca_is_refused(
+    no_ambient_tls_config, monkeypatch, tmp_path
+):
+    """In a pod, an absent CA must not fall back to the public roots."""
+    monkeypatch.setattr(utils, "IN_CLUSTER_CA_FILE", str(tmp_path / "absent.crt"))
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
+    with pytest.raises(RuntimeError, match="in-cluster CA"):
+        utils.tls_verify()
+
+
+def test_a_plaintext_endpoint_is_rejected_and_never_contacted(monkeypatch):
+    """requests ignores verify for http, so the token would go out in clear."""
+    contacted = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            contacted.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv(
+            "KUBERNETES_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}")
+        with pytest.raises(RuntimeError, match="must use https"):
+            utils.kubernetes_base_url()
+    finally:
+        server.shutdown()
+
+    assert contacted == []
+
+
+@pytest.mark.parametrize("base_url", [
+    "kubernetes.default.svc",
+    "https://",
+    "https://user:pass@api.example.com:6443",
+    "https://api.example.com:6443?token=x",
+    "https://api.example.com:6443#f",
+    "https://api.example.com:not-a-port",
+])
+def test_an_unusable_endpoint_is_rejected(monkeypatch, base_url):
+    monkeypatch.setenv("KUBERNETES_BASE_URL", base_url)
+    with pytest.raises(RuntimeError):
+        utils.kubernetes_base_url()
+
+
+def test_a_trailing_slash_is_normalised(monkeypatch):
+    monkeypatch.setenv("KUBERNETES_BASE_URL", "https://api.example.com:6443/")
+    assert utils.kubernetes_base_url() == "https://api.example.com:6443"
+
+
+@pytest.mark.parametrize(
+    "value, verification_skipped",
+    [
+        ("true", True),
+        ("True", True),
+        ("1", True),
+        ("yes", True),
+        ("on", True),
+        ("false", False),
+        ("False", False),
+        ("0", False),
+        ("no", False),
+        ("", False),
+        ("  ", False),
+        ("maybe", False),
+    ],
+)
+def test_only_an_explicit_opt_in_skips_verification(
+    no_ambient_tls_config, monkeypatch, value, verification_skipped
+):
+    monkeypatch.setenv("UNSAFE_SKIP_TLS_VERIFY", value)
+    assert (utils.tls_verify() is False) == verification_skipped
+
+
+@responses.activate
+@pytest.mark.parametrize("verify", [True, "/etc/ssl/certs/test-ca.crt"])
+def test_requests_carry_the_verify_setting(monkeypatch, verify):
+    monkeypatch.setattr(utils, "TLS_VERIFY", verify)
+    responses.get(CAPI_URI, json=TEST_JSON, status=200)
+    get_capi_cluster(NAME, NAMESPACE)
+    assert responses.calls[0].request.req_kwargs["verify"] == verify
+
+
+@pytest.mark.parametrize(
+    "environment, expected",
+    [
+        (
+            {"KUBERNETES_BASE_URL": "https://api.example.com:6443"},
+            "https://api.example.com:6443",
+        ),
+        (
+            {"KUBERNETES_SERVICE_HOST": "10.96.0.1",
+             "KUBERNETES_SERVICE_PORT": "443"},
+            "https://10.96.0.1:443",
+        ),
+        ({"KUBERNETES_SERVICE_HOST": "fd00::1"}, "https://[fd00::1]:443"),
+        ({"KUBERNETES_SERVICE_HOST": "[fd00::1]"}, "https://[fd00::1]:443"),
+        ({}, "https://kubernetes.default.svc"),
+    ],
+)
+def test_kubernetes_base_url(monkeypatch, environment, expected):
+    for name in (
+        "KUBERNETES_BASE_URL",
+        "KUBERNETES_SERVICE_HOST",
+        "KUBERNETES_SERVICE_PORT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    assert utils.kubernetes_base_url() == expected

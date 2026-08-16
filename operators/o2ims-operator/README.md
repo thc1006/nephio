@@ -105,6 +105,49 @@ kpt live init /tmp/o2ims
 kpt live apply /tmp/o2ims --reconcile-timeout=15m --output=table
 ```
 
+### Connecting to the Kubernetes API
+
+The operator verifies the API server's certificate on every request. Inside a
+pod there is nothing to configure: the CA bundle mounted at
+`/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` is used, and the address
+comes from `KUBERNETES_SERVICE_HOST`, which is the one Kubernetes expects that
+certificate to be valid for.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `KUBERNETES_BASE_URL` | in-cluster address | API server to talk to |
+| `KUBERNETES_CA_FILE` | in-cluster CA bundle | PEM bundle used to verify the API server |
+| `UNSAFE_SKIP_TLS_VERIFY` | `false` | Development only: skip certificate verification |
+
+Running the operator outside a cluster, point it at the API server and at the
+CA that signs its certificate:
+
+```bash
+export KUBERNETES_BASE_URL=$(kubectl config view --minify \
+  -o jsonpath='{.clusters[0].cluster.server}')
+
+# The CA is embedded in most kubeconfigs and a file path in some.
+kubectl config view --raw --minify \
+  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' \
+  | base64 -d > /tmp/cluster-ca.crt
+test -s /tmp/cluster-ca.crt || cp "$(kubectl config view --minify \
+  -o jsonpath='{.clusters[0].cluster.certificate-authority}')" /tmp/cluster-ca.crt
+export KUBERNETES_CA_FILE=/tmp/cluster-ca.crt
+
+# TOKEN is a path, not a token. Outside a pod there is no mounted one, so
+# request a short-lived credential and point at the file.
+kubectl -n o2ims create token o2ims-operator --duration=1h > /tmp/o2ims-token
+chmod 0600 /tmp/o2ims-token
+export TOKEN=/tmp/o2ims-token
+```
+
+The token expires; re-run the last three lines when it does. Inside a pod
+none of this applies, because the kubelet rotates the mounted one.
+
+`UNSAFE_SKIP_TLS_VERIFY=true` turns verification off altogether. It hands the
+service account token to an endpoint whose identity has not been checked, warns
+about it at startup, and must never be used outside development.
+
 ### Redeploying
 
 To redeploy the cluster, or to recreate the development environment, one must delete the created cluster. The Nephio mgmt cluster will be deleted automatically when running `create-cluster.sh`, but the cluster deployed by this operator has a name in the `clusterName` field. For example, it may be `edge`, thus:
