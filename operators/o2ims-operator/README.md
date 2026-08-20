@@ -123,26 +123,54 @@ Running the operator outside a cluster, point it at the API server and at the
 CA that signs its certificate:
 
 ```bash
-export KUBERNETES_BASE_URL=$(kubectl config view --minify \
+# Assigned before exporting: export always succeeds, so it would hide a kubectl
+# that failed, and an empty value here falls back to the in-cluster name.
+KUBERNETES_BASE_URL=$(kubectl config view --minify \
   -o jsonpath='{.clusters[0].cluster.server}')
+test -n "$KUBERNETES_BASE_URL" && export KUBERNETES_BASE_URL ||
+  echo "kubeconfig names no server" >&2
 
-# The CA is embedded in most kubeconfigs and a file path in some.
-kubectl config view --raw --minify \
+# --flatten embeds the CA whether the kubeconfig holds it inline or as a
+# path, and a path is relative to the kubeconfig rather than to this shell.
+kubectl config view --raw --minify --flatten \
   -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' \
   | base64 -d > /tmp/cluster-ca.crt
-test -s /tmp/cluster-ca.crt || cp "$(kubectl config view --minify \
-  -o jsonpath='{.clusters[0].cluster.certificate-authority}')" /tmp/cluster-ca.crt
 export KUBERNETES_CA_FILE=/tmp/cluster-ca.crt
 
 # TOKEN is a path, not a token. Outside a pod there is no mounted one, so
 # request a short-lived credential and point at the file.
-kubectl -n o2ims create token o2ims-operator --duration=1h > /tmp/o2ims-token
-chmod 0600 /tmp/o2ims-token
+refresh_o2ims_token() {
+  tmp=$(mktemp /tmp/o2ims-token.XXXXXX) || return 1
+  chmod 0600 "$tmp" || { rm -f "$tmp"; return 1; }
+
+  if ! kubectl -n o2ims create token o2ims-operator --duration=1h > "$tmp" ||
+     ! test -s "$tmp"; then
+    rm -f "$tmp"
+    echo "token refresh failed; the previous token is unchanged" >&2
+    return 1
+  fi
+
+  mv -f "$tmp" /tmp/o2ims-token
+}
+
+refresh_o2ims_token
 export TOKEN=/tmp/o2ims-token
 ```
 
-The token expires; re-run the last three lines when it does. Inside a pod
-none of this applies, because the kubelet rotates the mounted one.
+The rename matters. The operator opens this file on every request, and `>`
+truncates before `kubectl` finishes writing, so a request landing in that window
+would read an empty token. A rename on the same filesystem is atomic: a reader
+sees either the whole old file or the whole new one.
+
+So does keeping the failure off that path. The redirection creates the
+temporary file before `kubectl` runs, so an expired kubeconfig or an
+unreachable API server leaves it empty; renaming that over a token that is
+still valid causes the outage the rename exists to prevent, and the operator
+reports `Kubernetes token file ... is empty`. The function above discards the
+temporary file instead and leaves the old one in place.
+
+Re-run `refresh_o2ims_token` when the token expires. Inside a pod none of this
+applies, because the kubelet rotates the mounted one.
 
 `UNSAFE_SKIP_TLS_VERIFY=true` turns verification off altogether. It hands the
 service account token to an endpoint whose identity has not been checked, warns
